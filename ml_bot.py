@@ -166,16 +166,107 @@ def extrair_produto(texto_html):
     return {"titulo": titulo, "imagem": imagem, "preco": preco}
 
 
+
+def _id_item_ml(url):
+    """Extrai um ID MLB de uma URL final do Mercado Livre, quando existir."""
+    match = re.search(r"\b(MLB-?\d{6,})\b", url, re.I)
+    return match.group(1).upper().replace("-", "") if match else None
+
+
+def _consultar_api_ml(url):
+    """
+    Tenta obter título, imagem e preço pela API pública do Mercado Livre.
+    Pode não funcionar para todos os anúncios ou regiões; por isso é fallback.
+    """
+    item_id = _id_item_ml(url)
+    if not item_id:
+        return {}
+    try:
+        resposta = requests.get(
+            f"https://api.mercadolibre.com/items/{item_id}",
+            headers=HEADERS,
+            timeout=20,
+        )
+        if resposta.status_code != 200:
+            print(f"API Mercado Livre: HTTP {resposta.status_code} para {item_id}")
+            return {}
+        dados = resposta.json()
+        fotos = dados.get("pictures") or []
+        imagem = ""
+        if fotos:
+            imagem = fotos[0].get("secure_url") or fotos[0].get("url") or ""
+        valor = dados.get("price")
+        try:
+            valor = float(valor) if valor is not None else None
+        except (TypeError, ValueError):
+            valor = None
+        return {
+            "titulo": str(dados.get("title") or "").strip(),
+            "imagem": imagem,
+            "preco": valor,
+        }
+    except Exception as exc:
+        print("Não consegui consultar a API do Mercado Livre:", repr(exc))
+        return {}
+
+
+def _preco_embutido_html(texto_html):
+    """Procura preços em metadados comuns e em campos JSON embutidos."""
+    for propriedade in (
+        "product:price:amount", "og:price:amount", "price",
+        "product:sale_price:amount",
+    ):
+        valor = meta(texto_html, propriedade)
+        if valor:
+            try:
+                return float(valor.replace(".", "").replace(",", ".")) if "," in valor else float(valor)
+            except ValueError:
+                pass
+
+    # Alguns templates embutem campos de preço fora do JSON-LD.
+    padroes = (
+        r'"price"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)"?',
+        r'"sale_price"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)"?',
+        r'"amount"\s*:\s*"?(\d+(?:[.,]\d{1,2})?)"?',
+    )
+    for padrao in padroes:
+        for achado in re.findall(padrao, texto_html, re.I):
+            try:
+                valor = achado.replace(",", ".")
+                numero = float(valor)
+                # Ignora números improváveis que possam ser IDs ou outras métricas.
+                if 0 < numero < 10000000:
+                    return numero
+            except ValueError:
+                continue
+    return None
+
+
 def buscar_produto(url):
     resposta = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
     if resposta.status_code != 200:
         raise RuntimeError(f"a página respondeu HTTP {resposta.status_code}")
+
     produto = extrair_produto(resposta.text)
-    if not produto["titulo"]:
+    produto["url_final"] = resposta.url
+
+    # Tenta outra fonte para o preço caso o HTML não o tenha fornecido.
+    if produto.get("preco") is None:
+        produto["preco"] = _preco_embutido_html(resposta.text)
+
+    # O link curto meli.la costuma redirecionar para a página do item;
+    # se houver ID MLB na URL final, tenta a API pública como alternativa.
+    api_produto = _consultar_api_ml(resposta.url)
+    for campo in ("titulo", "imagem", "preco"):
+        if produto.get(campo) in ("", None) and api_produto.get(campo) not in ("", None):
+            produto[campo] = api_produto[campo]
+
+    if not produto.get("titulo"):
         raise RuntimeError(
             "não consegui ler o título do produto (a página pode estar bloqueada ou diferente)"
         )
-    produto["url_final"] = resposta.url
+    if produto.get("preco") is None:
+        print("Aviso: o preço não foi encontrado no HTML nem na API pública.")
     return produto
 
 
@@ -184,6 +275,8 @@ def montar_legenda(produto, extra=""):
     linhas = [f"🔥 {produto['titulo']}"]
     if produto["preco"] is not None:
         linhas += ["", f"💰 {formatar_preco(produto['preco'])}"]
+    else:
+        linhas += ["", "💰 Consulte o preço atualizado no botão Comprar"]
     if extra:
         linhas += ["", extra]
     return "\n".join(linhas)
