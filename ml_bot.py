@@ -1,7 +1,8 @@
+
 """
 Bot de ofertas do Mercado Livre para Telegram.
-Recebe links no privado e publica no grupo com foto,
-título, preço antigo quando disponível, preço atual e botão.
+Recebe links no privado e publica no grupo com:
+foto, título, preço atual e botão de compra.
 """
 
 import html
@@ -14,6 +15,7 @@ import time
 import requests
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+
 GROUP_ID = os.environ.get(
     "TELEGRAM_CHAT_ID", "-1003727651878"
 ).strip()
@@ -35,10 +37,7 @@ HEADERS = {
         "Chrome/124.0 Safari/537.36"
     ),
     "Accept-Language": "pt-BR,pt;q=0.9",
-    "Accept": "text/html,application/xhtml+xml",
 }
-
-URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
 # ---------------- TELEGRAM ----------------
@@ -66,61 +65,15 @@ def tg(method, **data):
 
 
 def responder(chat_id, texto):
-    resultado = tg(
+    tg(
         "sendMessage",
         chat_id=chat_id,
         text=texto,
         disable_web_page_preview="true",
     )
 
-    if not resultado.get("ok"):
-        print("Erro ao enviar mensagem privada:", resultado)
 
-
-# ---------------- EXTRAÇÃO DE DADOS ----------------
-
-def meta(texto, propriedade):
-    padroes = [
-        rf'<meta[^>]+(?:property|name|itemprop)='
-        rf'["\']{re.escape(propriedade)}["\'][^>]*'
-        rf'content=["\']([^"\']*)["\']',
-
-        rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*'
-        rf'(?:property|name|itemprop)='
-        rf'["\']{re.escape(propriedade)}["\']',
-    ]
-
-    for padrao in padroes:
-        encontrado = re.search(padrao, texto, re.I)
-        if encontrado:
-            return html.unescape(encontrado.group(1)).strip()
-
-    return ""
-
-
-def achar_produto(objeto):
-    if isinstance(objeto, list):
-        for item in objeto:
-            resultado = achar_produto(item)
-            if resultado:
-                return resultado
-
-    elif isinstance(objeto, dict):
-        tipo = objeto.get("@type")
-
-        if tipo == "Product":
-            return objeto
-
-        if isinstance(tipo, list) and "Product" in tipo:
-            return objeto
-
-        for valor in objeto.values():
-            resultado = achar_produto(valor)
-            if resultado:
-                return resultado
-
-    return None
-
+# ---------------- PREÇO E PRODUTO ----------------
 
 def converter_preco(valor):
     if valor is None or valor == "":
@@ -141,23 +94,8 @@ def converter_preco(valor):
 
         return numero if numero > 0 else None
 
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         return None
-
-
-def preco_das_ofertas(ofertas):
-    if isinstance(ofertas, list):
-        ofertas = ofertas[0] if ofertas else {}
-
-    if not isinstance(ofertas, dict):
-        return None
-
-    for chave in ("price", "lowPrice"):
-        valor = converter_preco(ofertas.get(chave))
-        if valor is not None:
-            return valor
-
-    return None
 
 
 def formatar_preco(valor):
@@ -174,11 +112,74 @@ def formatar_preco(valor):
     return f"R$ {texto}"
 
 
+def meta(texto_html, propriedade):
+    padroes = [
+        rf'<meta[^>]+(?:property|name|itemprop)='
+        rf'["\']{re.escape(propriedade)}["\'][^>]*'
+        rf'content=["\']([^"\']*)["\']',
+
+        rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*'
+        rf'(?:property|name|itemprop)='
+        rf'["\']{re.escape(propriedade)}["\']',
+    ]
+
+    for padrao in padroes:
+        achado = re.search(padrao, texto_html, re.I)
+
+        if achado:
+            return html.unescape(
+                achado.group(1)
+            ).strip()
+
+    return ""
+
+
+def achar_produto(objeto):
+    if isinstance(objeto, list):
+        for item in objeto:
+            encontrado = achar_produto(item)
+
+            if encontrado:
+                return encontrado
+
+    elif isinstance(objeto, dict):
+        tipo = objeto.get("@type")
+
+        if tipo == "Product":
+            return objeto
+
+        if isinstance(tipo, list) and "Product" in tipo:
+            return objeto
+
+        for valor in objeto.values():
+            encontrado = achar_produto(valor)
+
+            if encontrado:
+                return encontrado
+
+    return None
+
+
+def preco_das_ofertas(ofertas):
+    if isinstance(ofertas, list):
+        ofertas = ofertas[0] if ofertas else {}
+
+    if not isinstance(ofertas, dict):
+        return None
+
+    for chave in ("price", "lowPrice"):
+        preco = converter_preco(ofertas.get(chave))
+
+        if preco is not None:
+            return preco
+
+    return None
+
+
 def extrair_produto(texto_html):
     titulo = ""
     imagem = ""
     preco = None
-    preco_antigo = None
 
     blocos = re.findall(
         r'<script[^>]+application/ld\+json[^>]*>'
@@ -191,7 +192,7 @@ def extrair_produto(texto_html):
         try:
             dados = json.loads(bloco)
             produto = achar_produto(dados)
-        except Exception:
+        except (ValueError, TypeError):
             continue
 
         if not produto:
@@ -216,20 +217,6 @@ def extrair_produto(texto_html):
                 produto.get("offers")
             )
 
-        for chave in (
-            "listPrice",
-            "originalPrice",
-            "original_price",
-        ):
-            valor = converter_preco(produto.get(chave))
-
-            if (
-                valor is not None
-                and (preco is None or valor > preco)
-            ):
-                preco_antigo = valor
-                break
-
     titulo = titulo or meta(texto_html, "og:title")
     imagem = imagem or meta(texto_html, "og:image")
 
@@ -246,22 +233,6 @@ def extrair_produto(texto_html):
             if preco is not None:
                 break
 
-    for propriedade in (
-        "product:original_price:amount",
-        "og:price:standard_amount",
-        "product:price:original_amount",
-    ):
-        valor = converter_preco(
-            meta(texto_html, propriedade)
-        )
-
-        if (
-            valor is not None
-            and (preco is None or valor > preco)
-        ):
-            preco_antigo = preco_antigo or valor
-            break
-
     titulo = re.sub(
         r"\s*[|\-–]\s*Mercado Livre.*$",
         "",
@@ -273,21 +244,20 @@ def extrair_produto(texto_html):
         "titulo": titulo,
         "imagem": imagem,
         "preco": preco,
-        "preco_antigo": preco_antigo,
     }
 
 
 # ---------------- API DO MERCADO LIVRE ----------------
 
 def extrair_id_item(url):
-    encontrado = re.search(
+    achado = re.search(
         r"\b(MLB-?\d{6,})\b",
         url,
         re.I,
     )
 
-    if encontrado:
-        return encontrado.group(1).upper().replace("-", "")
+    if achado:
+        return achado.group(1).upper().replace("-", "")
 
     return None
 
@@ -296,6 +266,10 @@ def consultar_api_ml(url):
     item_id = extrair_id_item(url)
 
     if not item_id:
+        print(
+            "Não foi possível identificar o ID do anúncio "
+            "para consultar a API."
+        )
         return {}
 
     try:
@@ -307,14 +281,14 @@ def consultar_api_ml(url):
 
         if resposta.status_code != 200:
             print(
-                "API do Mercado Livre retornou:",
+                "API do Mercado Livre:",
                 resposta.status_code,
+                resposta.text[:300],
             )
             return {}
 
         dados = resposta.json()
         fotos = dados.get("pictures") or []
-
         imagem = ""
 
         if fotos:
@@ -324,138 +298,100 @@ def consultar_api_ml(url):
                 or ""
             )
 
+        preco = converter_preco(dados.get("price"))
+
+        print(
+            f"API do Mercado Livre: "
+            f"preço encontrado = {preco}"
+        )
+
         return {
-            "titulo": str(dados.get("title") or "").strip(),
+            "titulo": dados.get("title") or "",
             "imagem": imagem,
-            "preco": converter_preco(dados.get("price")),
-            "preco_antigo": converter_preco(
-                dados.get("original_price")
-            ),
+            "preco": preco,
         }
 
     except Exception as exc:
-        print("Erro ao consultar API do Mercado Livre:", exc)
+        print("Erro ao consultar API:", repr(exc))
         return {}
 
 
-def identificar_loja(url):
-    host = (
-        requests.utils.urlparse(url).hostname or ""
-    ).lower()
-
-    host = host.removeprefix("www.")
-
-    if any(
-        dominio in host
-        for dominio in (
-            "mercadolivre.com",
-            "mercadolibre.com",
-            "meli.la",
-        )
-    ):
-        return "Mercado Livre"
-
-    return "outra loja"
-
-
 def buscar_produto(url):
-    if identificar_loja(url) != "Mercado Livre":
-        raise RuntimeError(
-            "Envie um link do Mercado Livre."
+    try:
+        resposta = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+            allow_redirects=True,
         )
-
-    resposta = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=30,
-        allow_redirects=True,
-    )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Não consegui abrir o link: {exc}"
+        )
 
     if resposta.status_code != 200:
         raise RuntimeError(
-            f"A página respondeu HTTP {resposta.status_code}. "
-            "O Mercado Livre pode ter bloqueado a consulta."
+            f"O Mercado Livre respondeu HTTP "
+            f"{resposta.status_code}."
         )
 
+    url_final = resposta.url
+
     produto = extrair_produto(resposta.text)
-    produto["url_final"] = resposta.url
-    produto["loja"] = "Mercado Livre"
 
-    api_produto = consultar_api_ml(resposta.url)
+    # Tenta completar os dados pela API.
+    dados_api = consultar_api_ml(url_final)
 
-    for campo in (
-        "titulo",
-        "imagem",
-        "preco",
-        "preco_antigo",
-    ):
+    for campo in ("titulo", "imagem", "preco"):
         if produto.get(campo) in ("", None):
-            valor_api = api_produto.get(campo)
+            valor = dados_api.get(campo)
 
-            if valor_api not in ("", None):
-                produto[campo] = valor_api
+            if valor not in ("", None):
+                produto[campo] = valor
+
+    # Não inventa preços.
+    if produto.get("preco") is None:
+        print(
+            "AVISO: o preço atual não foi encontrado "
+            "na página nem na API."
+        )
 
     if not produto.get("titulo"):
         raise RuntimeError(
-            "Não consegui encontrar o título do produto. "
-            "A página pode estar bloqueada ou exigir JavaScript."
+            "Não consegui encontrar o título do produto."
         )
-
-    preco = produto.get("preco")
-    antigo = produto.get("preco_antigo")
-
-    # Só mostra preço antigo se ele for maior que o atual.
-    if preco is not None and antigo is not None:
-        if antigo <= preco:
-            produto["preco_antigo"] = None
-
-    if produto.get("preco") is None:
-        print("Aviso: não encontrei o preço atual.")
-
-    if produto.get("preco_antigo") is None:
-        print("Aviso: não encontrei o preço antigo.")
 
     return produto
 
 
-# ---------------- PUBLICAÇÃO NO GRUPO ----------------
+# ---------------- LEGENDA E PUBLICAÇÃO ----------------
 
-def montar_legenda(produto, extra=""):
-    titulo = html.escape(produto["titulo"])
+def montar_legenda(produto):
+    titulo = html.escape(
+        produto.get("titulo") or "Oferta do Mercado Livre"
+    )
+
     linhas = [f"🔥 {titulo}"]
 
     preco = produto.get("preco")
-    antigo = produto.get("preco_antigo")
 
     if preco is not None:
-        if antigo is not None and antigo > preco:
-            linhas.extend([
-                "",
-                f"<s>De {formatar_preco(antigo)}</s>",
-                f"💥 POR {formatar_preco(preco)}!",
-            ])
-        else:
-            linhas.extend([
-                "",
-                f"💰 Preço atual: {formatar_preco(preco)}",
-            ])
-            linhas.append(
-                "ℹ️ Preço antigo não disponível."
-            )
+        linhas.extend([
+            "",
+            f"💰 PREÇO ATUAL: {formatar_preco(preco)}",
+        ])
     else:
         linhas.extend([
             "",
-            "💰 Consulte o preço atualizado no botão Comprar.",
+            "💰 Consulte o preço atualizado "
+            "no botão Comprar.",
         ])
-
-    if extra:
-        linhas.extend(["", html.escape(extra)])
 
     return "\n".join(linhas)
 
 
-def postar(produto, link, extra=""):
-    legenda = montar_legenda(produto, extra)
+def postar(produto, link):
+    legenda = montar_legenda(produto)
 
     botao = json.dumps({
         "inline_keyboard": [[
@@ -473,35 +409,32 @@ def postar(produto, link, extra=""):
             "sendPhoto",
             chat_id=GROUP_ID,
             photo=imagem,
-            caption=legenda[:1024],
+            caption=legenda,
             parse_mode="HTML",
             reply_markup=botao,
         )
 
         if resultado.get("ok"):
-            return True, ""
+            return True
 
         print(
-            "Não consegui enviar a foto:",
+            "Falha ao publicar foto:",
             resultado.get("description"),
         )
 
     resultado = tg(
         "sendMessage",
         chat_id=GROUP_ID,
-        text=legenda[:4096],
+        text=legenda,
         parse_mode="HTML",
         reply_markup=botao,
         disable_web_page_preview="true",
     )
 
-    return (
-        resultado.get("ok", False),
-        resultado.get("description", ""),
-    )
+    return resultado.get("ok", False)
 
 
-# ---------------- MENSAGENS RECEBIDAS ----------------
+# ---------------- RECEBER LINKS ----------------
 
 def tratar_mensagem(msg):
     chat = msg.get("chat", {})
@@ -510,29 +443,25 @@ def tratar_mensagem(msg):
         return
 
     uid = msg.get("from", {}).get("id")
-    texto = msg.get("text") or msg.get("caption") or ""
-
-    print(
-        f"Mensagem privada recebida. "
-        f"ID: {uid}; contém texto: {bool(texto)}"
-    )
+    texto = msg.get("text") or ""
 
     if uid not in ALLOWED:
-        if ALLOWED:
+        if not ALLOWED:
             responder(
                 chat["id"],
-                "Você não tem permissão para usar este bot.",
+                f"Seu ID do Telegram é: {uid}\n"
+                "Adicione esse ID ao segredo "
+                "ALLOWED_USER_IDS no GitHub.",
             )
         else:
             responder(
                 chat["id"],
-                f"Seu ID do Telegram é: {uid}\n"
-                "Adicione esse número ao segredo "
-                "ALLOWED_USER_IDS no GitHub.",
+                "Você não tem permissão para usar este bot.",
             )
+
         return
 
-    links = URL_RE.findall(texto)
+    links = re.findall(r"https?://[^\s<>\"']+", texto)
 
     if not links:
         responder(
@@ -541,48 +470,64 @@ def tratar_mensagem(msg):
         )
         return
 
-    extra = URL_RE.sub("", texto).strip() if len(links) == 1 else ""
-
     for link in links:
         link = link.rstrip(").,;")
 
-        try:
-            produto = buscar_produto(link)
-            sucesso, erro = postar(produto, link, extra)
+        host = (
+            requests.utils.urlparse(link).hostname or ""
+        ).lower()
 
-            if sucesso:
+        if not (
+            "mercadolivre.com" in host
+            or "mercadolibre.com" in host
+            or host.endswith("meli.la")
+        ):
+            responder(
+                chat["id"],
+                "Este bot aceita somente links do Mercado Livre.",
+            )
+            continue
+
+        try:
+            responder(
+                chat["id"],
+                "🔎 Buscando o produto e o preço atual...",
+            )
+
+            produto = buscar_produto(link)
+
+            if postar(produto, link):
                 responder(
                     chat["id"],
-                    "✅ Produto publicado no grupo!\n"
-                    f"{produto['titulo'][:100]}",
+                    "✅ Produto publicado no grupo!",
                 )
             else:
                 responder(
                     chat["id"],
-                    "❌ Não consegui publicar no grupo.\n"
-                    f"Motivo: {erro}",
+                    "❌ Não consegui publicar no grupo. "
+                    "Confira o ID do grupo e as permissões do bot.",
                 )
 
         except Exception as exc:
             print("Erro ao processar link:", repr(exc))
+
             responder(
                 chat["id"],
-                "❌ Não consegui ler esse produto.\n"
-                f"Motivo: {str(exc)[:300]}\n\n"
-                f"Link: {link}",
+                "❌ Não consegui processar esse produto.\n"
+                f"Motivo: {str(exc)[:300]}",
             )
 
         time.sleep(2)
 
 
-# ---------------- PROCESSAMENTO DO TELEGRAM ----------------
+# ---------------- PROCESSAR ATUALIZAÇÕES ----------------
 
-def processar(offset=None, espera=0):
+def processar(offset=None):
     total = 0
 
     while True:
         parametros = {
-            "timeout": espera if total == 0 else 0,
+            "timeout": 0,
             "allowed_updates": json.dumps(["message"]),
             "limit": 100,
         }
@@ -590,15 +535,14 @@ def processar(offset=None, espera=0):
         if offset is not None:
             parametros["offset"] = offset
 
-        print("Consultando mensagens pendentes...")
         resultado = tg("getUpdates", **parametros)
 
         if not resultado.get("ok"):
             print(
-                "Erro ao buscar mensagens:",
+                "Erro ao consultar mensagens:",
                 resultado.get("description"),
             )
-            return offset
+            break
 
         atualizacoes = resultado.get("result", [])
 
@@ -615,35 +559,38 @@ def processar(offset=None, espera=0):
                 try:
                     tratar_mensagem(mensagem)
                 except Exception as exc:
-                    print("Erro ao tratar mensagem:", repr(exc))
+                    print(
+                        "Erro ao tratar mensagem:",
+                        repr(exc),
+                    )
 
-    print(f"Processamento concluído: {total} atualização(ões).")
+    print(f"Atualizações processadas: {total}")
     return offset
 
 
 def main():
     if not TOKEN:
-        print("ERRO: configure o segredo TELEGRAM_TOKEN.")
+        print("ERRO: configure TELEGRAM_TOKEN no GitHub.")
         sys.exit(1)
 
-    print("Verificando o bot do Telegram...")
     resultado = tg("getMe")
 
     if not resultado.get("ok"):
         print(
-            "ERRO: token inválido ou problema de conexão. "
+            "ERRO: não consegui conectar ao Telegram. "
             "Confira TELEGRAM_TOKEN."
         )
         sys.exit(1)
 
     bot = resultado.get("result", {})
-    print(f"Bot conectado: @{bot.get('username', 'desconhecido')}")
+    print(f"Bot conectado: @{bot.get('username', '')}")
 
     if "--loop" in sys.argv:
         offset = None
 
         while True:
-            offset = processar(offset, espera=50)
+            offset = processar(offset)
+            time.sleep(3)
     else:
         processar()
 
