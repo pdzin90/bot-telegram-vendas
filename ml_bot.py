@@ -274,33 +274,64 @@ def tratar_mensagem(msg):
 
 # ------------------------------- Processamento de mensagens
 def processar(offset=None, espera=0):
-    parametros = {"timeout": espera, "allowed_updates": json.dumps(["message"])}
-    if offset is not None:
-        parametros["offset"] = offset
+    """
+    Processa todos os lotes de atualizações pendentes.
+    O offset é avançado lote a lote para não parar nos primeiros 100
+    eventos de grupo antes de chegar a mensagens privadas mais recentes.
+    """
+    total = 0
+    privados = 0
+    grupos = 0
 
-    print("Consultando mensagens pendentes no Telegram...")
-    resultado = tg("getUpdates", **parametros)
-    if not resultado.get("ok"):
-        print("ERRO em getUpdates:", resultado.get("description"))
-        return offset
+    while True:
+        parametros = {
+            "timeout": espera if total == 0 else 0,
+            "allowed_updates": json.dumps(["message"]),
+            "limit": 100,
+        }
+        if offset is not None:
+            parametros["offset"] = offset
 
-    atualizacoes = resultado.get("result", [])
-    print(f"Telegram respondeu OK. Mensagens/atualizações recebidas: {len(atualizacoes)}")
-    ultimo = None
+        print("Consultando mensagens pendentes no Telegram...")
+        resultado = tg("getUpdates", **parametros)
+        if not resultado.get("ok"):
+            print("ERRO em getUpdates:", resultado.get("description"))
+            return offset
 
-    for atualizacao in atualizacoes:
-        ultimo = atualizacao["update_id"]
-        if "message" in atualizacao:
-            try:
-                tratar_mensagem(atualizacao["message"])
-            except Exception as exc:
-                print("ERRO ao tratar mensagem:", repr(exc))
+        atualizacoes = resultado.get("result", [])
+        print(f"Lote recebido: {len(atualizacoes)} atualização(ões).")
+        if not atualizacoes:
+            break
 
-    if ultimo is not None:
-        offset = ultimo + 1
-        confirmacao = tg("getUpdates", offset=offset, timeout=0)
-        if not confirmacao.get("ok"):
-            print("Aviso: não consegui confirmar as atualizações:", confirmacao.get("description"))
+        for atualizacao in atualizacoes:
+            offset = atualizacao["update_id"] + 1
+            total += 1
+            mensagem = atualizacao.get("message")
+            if not mensagem:
+                continue
+
+            tipo_chat = mensagem.get("chat", {}).get("type")
+            if tipo_chat == "private":
+                privados += 1
+                try:
+                    tratar_mensagem(mensagem)
+                except Exception as exc:
+                    print("ERRO ao tratar mensagem privada:", repr(exc))
+            else:
+                grupos += 1
+                # As mensagens de grupo são ignoradas de propósito; o bot
+                # recebe links apenas por conversa privada.
+
+        # A próxima chamada com offset confirma apenas o lote já processado
+        # e busca o próximo lote, caso ainda existam atualizações pendentes.
+        # Faz outra consulta mesmo quando o lote veio menor que 100:
+        # essa chamada confirma o lote anterior e verifica se há mais eventos.
+        # O loop termina quando a consulta seguinte retornar lista vazia.
+
+    print(
+        f"Resumo: {total} atualização(ões) processada(s), "
+        f"{privados} mensagem(ns) privada(s), {grupos} mensagem(ns) de grupo ignorada(s)."
+    )
     return offset
 
 
