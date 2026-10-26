@@ -1,18 +1,15 @@
 """
-Bot que recebe LINKS do Mercado Livre no privado e posta no grupo com foto, titulo e preco.
+Bot que recebe LINKS do Mercado Livre no privado e posta no grupo com foto,
+título e preço.
 
-Uso: voce manda o link (pode mandar varios, um por linha) numa conversa privada com o bot.
-Texto escrito junto com UM link vira uma observacao extra na postagem.
+No GitHub Actions, execute: python ml_bot.py
+O programa consulta as mensagens pendentes, responde ao usuário e termina.
 
-Modos:
-  python ml_bot.py          -> processa o que chegou e sai (GitHub Actions)
-  python ml_bot.py --loop   -> fica ouvindo o tempo todo, resposta quase instantanea (PC ou hospedagem 24h)
-
-Variaveis de ambiente:
-  TELEGRAM_TOKEN     token do bot (obrigatorio)
-  TELEGRAM_CHAT_ID   id do grupo (padrao: o seu grupo)
-  ALLOWED_USER_IDS   ids de quem pode mandar links, separados por virgula
-                     (se vazio, o bot so responde mostrando o id de quem escreveu)
+Variáveis de ambiente:
+  TELEGRAM_TOKEN     token do bot (obrigatório)
+  TELEGRAM_CHAT_ID   ID do grupo (padrão: -1003727651878)
+  ALLOWED_USER_IDS   IDs autorizados, separados por vírgula.
+                     Se vazio, o bot responde mostrando o ID de quem escreveu.
 """
 
 import html as htmllib
@@ -24,11 +21,14 @@ import time
 
 import requests
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROUP_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003727651878")
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+GROUP_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003727651878").strip()
 ALLOWED = {
-    int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()
+    int(x)
+    for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",")
+    if x.strip().lstrip("-").isdigit()
 }
+
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 HEADERS = {
@@ -42,45 +42,65 @@ HEADERS = {
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
-# ---------------------------------------------------------------- Telegram
+# ------------------------------- Telegram
 def tg(method, **data):
+    """Chama a API do Telegram e devolve a resposta, incluindo erros."""
     try:
-        r = requests.post(f"{API}/{method}", data=data, timeout=70)
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "description": str(e)}
+        response = requests.post(f"{API}/{method}", data=data, timeout=70)
+        try:
+            result = response.json()
+        except ValueError:
+            return {
+                "ok": False,
+                "description": f"Resposta não JSON do Telegram (HTTP {response.status_code})",
+            }
+        if not result.get("ok"):
+            print(f"Telegram {method}: {result.get('description', 'erro sem descrição')}")
+        return result
+    except Exception as exc:
+        print(f"Falha de conexão em {method}: {exc}")
+        return {"ok": False, "description": str(exc)}
 
 
 def responder(chat_id, texto):
-    tg("sendMessage", chat_id=chat_id, text=texto, disable_web_page_preview="true")
+    resultado = tg(
+        "sendMessage",
+        chat_id=chat_id,
+        text=texto,
+        disable_web_page_preview="true",
+    )
+    if not resultado.get("ok"):
+        print("Não consegui enviar mensagem privada:", resultado.get("description"))
+    else:
+        print(f"Mensagem enviada com sucesso para o chat {chat_id}.")
 
 
-# ---------------------------------------------------------------- leitura da pagina
+# ------------------------------- Leitura da página do produto
 def meta(texto, prop):
     for padrao in (
         rf'<meta[^>]+(?:property|name|itemprop)=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']',
         rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name|itemprop)=["\']{re.escape(prop)}["\']',
     ):
-        m = re.search(padrao, texto, re.I)
-        if m:
-            return htmllib.unescape(m.group(1)).strip()
+        match = re.search(padrao, texto, re.I)
+        if match:
+            return htmllib.unescape(match.group(1)).strip()
     return ""
 
 
 def _achar_produto(obj):
     if isinstance(obj, list):
-        for x in obj:
-            p = _achar_produto(x)
-            if p:
-                return p
+        for item in obj:
+            produto = _achar_produto(item)
+            if produto:
+                return produto
     elif isinstance(obj, dict):
         tipo = obj.get("@type")
         if tipo == "Product" or (isinstance(tipo, list) and "Product" in tipo):
             return obj
-        for v in obj.values():
-            p = _achar_produto(v)
-            if p:
-                return p
+        for valor in obj.values():
+            produto = _achar_produto(valor)
+            if produto:
+                return produto
     return None
 
 
@@ -98,37 +118,43 @@ def _preco_de_offers(offers):
     return None
 
 
-def formatar_preco(v):
-    s = f"{v:,.2f}"                      # 1,234.50
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-    return "R$ " + (s[:-3] if s.endswith(",00") else s)
+def formatar_preco(valor):
+    texto = f"{valor:,.2f}"
+    texto = texto.replace(",", "X").replace(".", ",").replace("X", ".")
+    return "R$ " + (texto[:-3] if texto.endswith(",00") else texto)
 
 
 def extrair_produto(texto_html):
     titulo = imagem = ""
     preco = None
 
-    for bloco in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', texto_html, re.S | re.I):
+    blocos = re.findall(
+        r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+        texto_html,
+        re.S | re.I,
+    )
+    for bloco in blocos:
         try:
-            prod = _achar_produto(json.loads(bloco))
+            produto = _achar_produto(json.loads(bloco))
         except Exception:
             continue
-        if not prod:
+        if not produto:
             continue
-        titulo = titulo or str(prod.get("name") or "").strip()
-        img = prod.get("image")
+        titulo = titulo or str(produto.get("name") or "").strip()
+        img = produto.get("image")
         if isinstance(img, list):
             img = img[0] if img else ""
         if isinstance(img, dict):
             img = img.get("url", "")
         imagem = imagem or (img or "")
-        preco = preco if preco is not None else _preco_de_offers(prod.get("offers"))
+        if preco is None:
+            preco = _preco_de_offers(produto.get("offers"))
 
     titulo = titulo or meta(texto_html, "og:title")
     imagem = imagem or meta(texto_html, "og:image")
     if preco is None:
-        for prop in ("product:price:amount", "price", "og:price:amount"):
-            valor = meta(texto_html, prop)
+        for propriedade in ("product:price:amount", "price", "og:price:amount"):
+            valor = meta(texto_html, propriedade)
             if valor:
                 try:
                     preco = float(valor.replace(",", "."))
@@ -136,114 +162,165 @@ def extrair_produto(texto_html):
                 except ValueError:
                     pass
 
-    titulo = re.sub(r"\s*[|\-–]\s*Mercado\s*Livre.*$", "", titulo, flags=re.I).strip()
+    titulo = re.sub(r"\s*[|\-–]\s*Mercado Livre.*$", "", titulo, flags=re.I).strip()
     return {"titulo": titulo, "imagem": imagem, "preco": preco}
 
 
 def buscar_produto(url):
-    r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-    if r.status_code != 200:
-        raise RuntimeError(f"a pagina respondeu {r.status_code}")
-    prod = extrair_produto(r.text)
-    if not prod["titulo"]:
-        raise RuntimeError("nao consegui ler o titulo do produto (pagina diferente do esperado ou bloqueada)")
-    prod["url_final"] = r.url
-    return prod
+    resposta = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+    if resposta.status_code != 200:
+        raise RuntimeError(f"a página respondeu HTTP {resposta.status_code}")
+    produto = extrair_produto(resposta.text)
+    if not produto["titulo"]:
+        raise RuntimeError(
+            "não consegui ler o título do produto (a página pode estar bloqueada ou diferente)"
+        )
+    produto["url_final"] = resposta.url
+    return produto
 
 
-# ---------------------------------------------------------------- postagem
-def montar_legenda(prod, extra=""):
-    linhas = [f"🔥 {prod['titulo']}"]
-    if prod["preco"] is not None:
-        linhas += ["", f"💰 {formatar_preco(prod['preco'])}"]
+# ------------------------------- Postagem no grupo
+def montar_legenda(produto, extra=""):
+    linhas = [f"🔥 {produto['titulo']}"]
+    if produto["preco"] is not None:
+        linhas += ["", f"💰 {formatar_preco(produto['preco'])}"]
     if extra:
         linhas += ["", extra]
     return "\n".join(linhas)
 
 
-def postar(prod, link, extra=""):
-    legenda = montar_legenda(prod, extra)
-    botao = json.dumps({"inline_keyboard": [[{"text": "🛒 Comprar", "url": link}]]})
+def postar(produto, link, extra=""):
+    legenda = montar_legenda(produto, extra)
+    botao = json.dumps(
+        {"inline_keyboard": [[{"text": "🛒 Comprar", "url": link}]]}
+    )
 
-    imagem = prod["imagem"]
+    imagem = produto["imagem"]
     if imagem:
         candidatas = []
         if imagem.lower().endswith(".webp"):
             candidatas.append(imagem[:-5] + ".jpg")
         candidatas.append(imagem)
         for foto in candidatas:
-            res = tg("sendPhoto", chat_id=GROUP_ID, photo=foto, caption=legenda[:1024], reply_markup=botao)
-            if res.get("ok"):
+            resultado = tg(
+                "sendPhoto",
+                chat_id=GROUP_ID,
+                photo=foto,
+                caption=legenda[:1024],
+                reply_markup=botao,
+            )
+            if resultado.get("ok"):
                 return True, ""
-    res = tg("sendMessage", chat_id=GROUP_ID, text=legenda[:4096], reply_markup=botao,
-             disable_web_page_preview="true")
-    return res.get("ok", False), res.get("description", "")
+            print("Falha ao postar foto; tentando alternativa.")
+
+    resultado = tg(
+        "sendMessage",
+        chat_id=GROUP_ID,
+        text=legenda[:4096],
+        reply_markup=botao,
+        disable_web_page_preview="true",
+    )
+    return resultado.get("ok", False), resultado.get("description", "")
 
 
 def tratar_mensagem(msg):
     chat = msg.get("chat", {})
     if chat.get("type") != "private":
-        return                                   # ignora o que acontece dentro de grupos
+        print("Mensagem ignorada: não veio de conversa privada.")
+        return
+
     uid = msg.get("from", {}).get("id")
     texto = msg.get("text") or msg.get("caption") or ""
+    print(f"Mensagem privada recebida. ID do usuário: {uid}; texto recebido: {bool(texto)}")
 
     if uid not in ALLOWED:
         if ALLOWED:
             responder(chat["id"], "Sem permissão para usar este bot.")
         else:
-            responder(chat["id"], f"Seu id do Telegram é: {uid}\n"
-                                  "Cadastre esse número no segredo ALLOWED_USER_IDS para liberar o bot.")
+            responder(
+                chat["id"],
+                f"Seu ID do Telegram é: {uid}\n"
+                "Cadastre esse número no segredo ALLOWED_USER_IDS para liberar o bot.",
+            )
         return
 
     links = URL_RE.findall(texto)
     if not links:
-        responder(chat["id"], "Me envie o link do produto do Mercado Livre (pode mandar vários, um por linha).")
+        responder(
+            chat["id"],
+            "Me envie o link do produto do Mercado Livre (pode mandar vários, um por linha).",
+        )
         return
 
     extra = URL_RE.sub("", texto).strip() if len(links) == 1 else ""
     for link in links:
         link = link.rstrip(").,;")
         try:
-            prod = buscar_produto(link)
-            ok, erro = postar(prod, link, extra)
+            produto = buscar_produto(link)
+            ok, erro = postar(produto, link, extra)
             if ok:
-                aviso = "" if prod["preco"] is not None else "\n(atenção: não achei o preço, postei sem ele)"
-                responder(chat["id"], f"✅ Postado: {prod['titulo'][:60]}{aviso}")
+                aviso = (
+                    ""
+                    if produto["preco"] is not None
+                    else "\n(Atenção: não encontrei o preço, então publiquei sem ele.)"
+                )
+                responder(chat["id"], f"✅ Postado: {produto['titulo'][:60]}{aviso}")
             else:
                 responder(chat["id"], f"❌ Não consegui postar no grupo: {erro}")
-        except Exception as e:
-            responder(chat["id"], f"❌ Não consegui ler esse link ({e}):\n{link}")
+        except Exception as exc:
+            responder(chat["id"], f"❌ Não consegui ler esse link ({exc}):\n{link}")
         time.sleep(2)
 
 
+# ------------------------------- Processamento de mensagens
 def processar(offset=None, espera=0):
-    params = {"timeout": espera, "allowed_updates": json.dumps(["message"])}
-    if offset:
-        params["offset"] = offset
-    res = tg("getUpdates", **params)
-    if not res.get("ok"):
-        print("Erro no getUpdates:", res.get("description"))
+    parametros = {"timeout": espera, "allowed_updates": json.dumps(["message"])}
+    if offset is not None:
+        parametros["offset"] = offset
+
+    print("Consultando mensagens pendentes no Telegram...")
+    resultado = tg("getUpdates", **parametros)
+    if not resultado.get("ok"):
+        print("ERRO em getUpdates:", resultado.get("description"))
         return offset
+
+    atualizacoes = resultado.get("result", [])
+    print(f"Telegram respondeu OK. Mensagens/atualizações recebidas: {len(atualizacoes)}")
     ultimo = None
-    for up in res.get("result", []):
-        ultimo = up["update_id"]
-        if "message" in up:
+
+    for atualizacao in atualizacoes:
+        ultimo = atualizacao["update_id"]
+        if "message" in atualizacao:
             try:
-                tratar_mensagem(up["message"])
-            except Exception as e:
-                print("Erro tratando mensagem:", e)
+                tratar_mensagem(atualizacao["message"])
+            except Exception as exc:
+                print("ERRO ao tratar mensagem:", repr(exc))
+
     if ultimo is not None:
         offset = ultimo + 1
-        tg("getUpdates", offset=offset, timeout=0)   # confirma: o Telegram nao reenvia estas mensagens
+        confirmacao = tg("getUpdates", offset=offset, timeout=0)
+        if not confirmacao.get("ok"):
+            print("Aviso: não consegui confirmar as atualizações:", confirmacao.get("description"))
     return offset
 
 
 def main():
     if not TOKEN:
-        print("Faltou o token. Defina TELEGRAM_TOKEN.")
+        print("ERRO: faltou o token. Configure o segredo TELEGRAM_TOKEN.")
         sys.exit(1)
+
+    print("Testando o token do Telegram...")
+    me = tg("getMe")
+    if not me.get("ok"):
+        print("ERRO: o Telegram não aceitou o token. Confira o segredo TELEGRAM_TOKEN.")
+        sys.exit(1)
+
+    bot = me.get("result", {})
+    print(f"Token válido. Bot conectado: @{bot.get('username', 'sem_username')}")
+    print("Iniciando leitura de mensagens...")
+
     if "--loop" in sys.argv:
-        print("Ouvindo mensagens. Ctrl+C para parar.")
+        print("Modo contínuo ativado. Ctrl+C para parar.")
         offset = None
         while True:
             offset = processar(offset, espera=50)
