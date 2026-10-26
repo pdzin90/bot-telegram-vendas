@@ -1,6 +1,6 @@
 """
-Bot que recebe LINKS do Mercado Livre no privado e posta no grupo com foto,
-título e preço.
+Bot que recebe links do Mercado Livre ou Shopee no privado e posta no grupo com foto,
+título, preço quando disponível e botão de compra.
 
 No GitHub Actions, execute: python ml_bot.py
 O programa consulta as mensagens pendentes, responde ao usuário e termina.
@@ -242,28 +242,75 @@ def _preco_embutido_html(texto_html):
     return None
 
 
+def identificar_loja(url):
+    host = re.sub(r"^www\.", "", (requests.utils.urlparse(url).hostname or "").lower())
+    if any(dominio in host for dominio in ("shopee.com", "shope.ee")):
+        return "Shopee"
+    if any(dominio in host for dominio in ("mercadolivre.com", "mercadolibre.com", "meli.la")):
+        return "Mercado Livre"
+    return "loja"
+
+
+def _preco_shopee_html(texto_html):
+    """Extrai apenas campos de preço conhecidos da página da Shopee.
+
+    A Shopee pode guardar preços em centavos nos campos price_min/price_max.
+    Evita usar números genéricos do HTML, que poderiam ser IDs ou contagens.
+    """
+    for propriedade in ("product:price:amount", "og:price:amount", "price"):
+        valor = meta(texto_html, propriedade)
+        if valor:
+            try:
+                numero = float(valor.replace(",", "."))
+                if numero > 0:
+                    return numero
+            except ValueError:
+                pass
+
+    # Campos comuns nos dados estruturados da Shopee. Eles normalmente estão em centavos.
+    for campo in ("price_min", "price_max"):
+        padrao = rf'''["\']{campo}["\']\s*:\s*["\']?(\d+(?:\.\d+)?)["\']?'''
+        for achado in re.findall(padrao, texto_html, re.I):
+            try:
+                numero = float(achado)
+            except ValueError:
+                continue
+            if numero <= 0:
+                continue
+            # Valores inteiros grandes em campos da Shopee costumam estar em centavos.
+            if campo in ("price_min", "price_max") and numero >= 1000:
+                numero /= 100
+            if numero < 100000:
+                return numero
+    return None
+
+
 def buscar_produto(url):
+    loja = identificar_loja(url)
     resposta = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
     if resposta.status_code != 200:
-        raise RuntimeError(f"a página respondeu HTTP {resposta.status_code}")
+        raise RuntimeError(f"a página respondeu HTTP {resposta.status_code}; a loja pode bloquear acessos automáticos")
 
     produto = extrair_produto(resposta.text)
     produto["url_final"] = resposta.url
+    produto["loja"] = identificar_loja(resposta.url) if identificar_loja(resposta.url) != "loja" else loja
 
-    # Tenta outra fonte para o preço caso o HTML não o tenha fornecido.
-    if produto.get("preco") is None:
+    # Tenta fontes de preço adequadas à loja, sem inventar um preço.
+    if produto.get("preco") is None and produto["loja"] == "Shopee":
+        produto["preco"] = _preco_shopee_html(resposta.text)
+    elif produto.get("preco") is None:
         produto["preco"] = _preco_embutido_html(resposta.text)
 
     # O link curto meli.la costuma redirecionar para a página do item;
     # se houver ID MLB na URL final, tenta a API pública como alternativa.
-    api_produto = _consultar_api_ml(resposta.url)
+    api_produto = _consultar_api_ml(resposta.url) if produto["loja"] == "Mercado Livre" else {}
     for campo in ("titulo", "imagem", "preco"):
         if produto.get(campo) in ("", None) and api_produto.get(campo) not in ("", None):
             produto[campo] = api_produto[campo]
 
     if not produto.get("titulo"):
         raise RuntimeError(
-            "não consegui ler o título do produto (a página pode estar bloqueada ou diferente)"
+            f"não consegui ler o título do produto da {produto['loja']} (a página pode exigir login, estar bloqueada ou carregar os dados por JavaScript)"
         )
     if produto.get("preco") is None:
         print("Aviso: o preço não foi encontrado no HTML nem na API pública.")
@@ -341,7 +388,7 @@ def tratar_mensagem(msg):
     if not links:
         responder(
             chat["id"],
-            "Me envie o link do produto do Mercado Livre (pode mandar vários, um por linha).",
+            "Me envie um link de produto do Mercado Livre ou da Shopee (pode mandar vários, um por linha).",
         )
         return
 
@@ -357,7 +404,7 @@ def tratar_mensagem(msg):
                     if produto["preco"] is not None
                     else "\n(Atenção: não encontrei o preço, então publiquei sem ele.)"
                 )
-                responder(chat["id"], f"✅ Postado: {produto['titulo'][:60]}{aviso}")
+                responder(chat["id"], f"✅ Postado ({produto.get('loja', 'loja')}): {produto['titulo'][:60]}{aviso}")
             else:
                 responder(chat["id"], f"❌ Não consegui postar no grupo: {erro}")
         except Exception as exc:
