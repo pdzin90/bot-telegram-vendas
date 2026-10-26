@@ -14,9 +14,7 @@ GROUP_ID = os.environ.get(
 
 ALLOWED = {
     int(x)
-    for x in os.environ.get(
-        "ALLOWED_USER_IDS", ""
-    ).replace(" ", "").split(",")
+    for x in os.environ.get("ALLOWED_USER_IDS", "").split(",")
     if x.strip().lstrip("-").isdigit()
 }
 
@@ -26,20 +24,22 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "pt-BR,pt;q=0.9",
 }
 
 
+# ---------- TELEGRAM ----------
+
 def telegram(metodo, **dados):
     try:
-        resposta = requests.post(
+        r = requests.post(
             f"{API}/{metodo}",
             data=dados,
             timeout=60,
         )
-        resultado = resposta.json()
+        resultado = r.json()
 
         if not resultado.get("ok"):
             print(
@@ -49,9 +49,9 @@ def telegram(metodo, **dados):
 
         return resultado
 
-    except Exception as erro:
-        print(f"Erro de conexão com Telegram: {erro}")
-        return {"ok": False, "description": str(erro)}
+    except Exception as e:
+        print("Erro de conexão com Telegram:", repr(e))
+        return {"ok": False}
 
 
 def responder(chat_id, texto):
@@ -62,8 +62,10 @@ def responder(chat_id, texto):
     )
 
 
+# ---------- PREÇOS ----------
+
 def converter_preco(valor):
-    if valor is None or valor == "":
+    if valor is None or isinstance(valor, bool):
         return None
 
     try:
@@ -79,7 +81,10 @@ def converter_preco(valor):
 
             numero = float(texto)
 
-        return numero if numero > 0 else None
+        if numero <= 0 or numero > 100000000:
+            return None
+
+        return numero
 
     except (ValueError, TypeError):
         return None
@@ -99,61 +104,31 @@ def formatar_preco(valor):
     return f"R$ {texto}"
 
 
-def extrair_id_item(url):
-    encontrado = re.search(
-        r"\b(MLB-?\d{6,})\b",
-        url,
-        re.IGNORECASE,
-    )
+def extrair_preco_json(conteudo):
+    """
+    Procura preços em estruturas JSON e dados incorporados
+    na página. Aceita apenas valores associados a campos
+    com nomes relacionados a preço.
+    """
 
-    if encontrado:
-        return encontrado.group(1).upper().replace("-", "")
+    padroes = [
+        r'"price"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
+        r'"priceAmount"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
+        r'"salePrice"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
+        r'"current_price"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
+        r'"price_with_currency"\s*:\s*"R\$\s*([\d.,]+)"',
+    ]
+
+    for padrao in padroes:
+        for encontrado in re.finditer(
+            padrao, conteudo, re.I
+        ):
+            valor = converter_preco(encontrado.group(1))
+
+            if valor is not None:
+                return valor
 
     return None
-
-
-def consultar_api_ml(url):
-    item_id = extrair_id_item(url)
-
-    if not item_id:
-        print("Não foi possível extrair o ID do anúncio.")
-        return {}
-
-    try:
-        resposta = requests.get(
-            f"https://api.mercadolibre.com/items/{item_id}",
-            headers=HEADERS,
-            timeout=20,
-        )
-
-        if resposta.status_code != 200:
-            print(
-                "API Mercado Livre:",
-                resposta.status_code,
-                resposta.text[:200],
-            )
-            return {}
-
-        dados = resposta.json()
-        fotos = dados.get("pictures") or []
-
-        imagem = ""
-        if fotos:
-            imagem = (
-                fotos[0].get("secure_url")
-                or fotos[0].get("url")
-                or ""
-            )
-
-        return {
-            "titulo": dados.get("title") or "",
-            "imagem": imagem,
-            "preco": converter_preco(dados.get("price")),
-        }
-
-    except Exception as erro:
-        print("Erro ao consultar API:", erro)
-        return {}
 
 
 def obter_meta(conteudo, propriedade):
@@ -168,10 +143,10 @@ def obter_meta(conteudo, propriedade):
     ]
 
     for padrao in padroes:
-        resultado = re.search(padrao, conteudo, re.I)
+        achado = re.search(padrao, conteudo, re.I)
 
-        if resultado:
-            return html.unescape(resultado.group(1)).strip()
+        if achado:
+            return html.unescape(achado.group(1)).strip()
 
     return ""
 
@@ -179,9 +154,10 @@ def obter_meta(conteudo, propriedade):
 def encontrar_produto(objeto):
     if isinstance(objeto, list):
         for item in objeto:
-            produto = encontrar_produto(item)
-            if produto:
-                return produto
+            encontrado = encontrar_produto(item)
+
+            if encontrado:
+                return encontrado
 
     elif isinstance(objeto, dict):
         tipo = objeto.get("@type")
@@ -193,14 +169,15 @@ def encontrar_produto(objeto):
             return objeto
 
         for valor in objeto.values():
-            produto = encontrar_produto(valor)
-            if produto:
-                return produto
+            encontrado = encontrar_produto(valor)
+
+            if encontrado:
+                return encontrado
 
     return None
 
 
-def extrair_dados(conteudo):
+def extrair_dados_pagina(conteudo):
     produto_final = {
         "titulo": "",
         "imagem": "",
@@ -216,10 +193,11 @@ def extrair_dados(conteudo):
 
     for bloco in blocos:
         try:
-            objeto = json.loads(bloco)
-            produto = encontrar_produto(objeto)
+            dados = json.loads(bloco)
         except (ValueError, TypeError):
             continue
+
+        produto = encontrar_produto(dados)
 
         if not produto:
             continue
@@ -244,10 +222,14 @@ def extrair_dados(conteudo):
             ofertas = ofertas[0] if ofertas else {}
 
         if isinstance(ofertas, dict):
-            produto_final["preco"] = converter_preco(
-                ofertas.get("price")
-                or ofertas.get("lowPrice")
-            )
+            for chave in ("price", "lowPrice"):
+                preco = converter_preco(
+                    ofertas.get(chave)
+                )
+
+                if preco is not None:
+                    produto_final["preco"] = preco
+                    break
 
         if produto_final["titulo"]:
             break
@@ -262,58 +244,154 @@ def extrair_dados(conteudo):
             conteudo, "og:image"
         )
 
+    # Primeiro tenta metadados específicos de preço.
     if produto_final["preco"] is None:
         for campo in (
             "product:price:amount",
             "og:price:amount",
+            "product:price",
         ):
-            produto_final["preco"] = converter_preco(
+            valor = converter_preco(
                 obter_meta(conteudo, campo)
             )
 
-            if produto_final["preco"] is not None:
+            if valor is not None:
+                produto_final["preco"] = valor
                 break
+
+    # Depois tenta dados JSON incorporados na página.
+    if produto_final["preco"] is None:
+        produto_final["preco"] = extrair_preco_json(
+            conteudo
+        )
+
+    produto_final["titulo"] = re.sub(
+        r"\s*[|\-–]\s*Mercado Livre.*$",
+        "",
+        produto_final["titulo"],
+        flags=re.I,
+    ).strip()
 
     return produto_final
 
 
-def buscar_produto(url):
-    resposta = requests.get(
+# ---------- API DO MERCADO LIVRE ----------
+
+def extrair_id_item(url):
+    encontrado = re.search(
+        r"\b(MLB-?\d{6,})\b",
         url,
-        headers=HEADERS,
-        timeout=30,
-        allow_redirects=True,
+        re.I,
     )
+
+    if encontrado:
+        return encontrado.group(1).upper().replace("-", "")
+
+    return None
+
+
+def consultar_api_ml(url):
+    item_id = extrair_id_item(url)
+
+    if not item_id:
+        print(
+            "API: não encontrei o ID do anúncio "
+            "na URL final."
+        )
+        return {}
+
+    try:
+        resposta = requests.get(
+            f"https://api.mercadolibre.com/items/{item_id}",
+            headers=HEADERS,
+            timeout=20,
+        )
+
+        print(
+            "API do Mercado Livre: HTTP",
+            resposta.status_code,
+        )
+
+        if resposta.status_code != 200:
+            print("Resposta da API:", resposta.text[:300])
+            return {}
+
+        dados = resposta.json()
+        fotos = dados.get("pictures") or []
+
+        imagem = ""
+
+        if fotos:
+            imagem = (
+                fotos[0].get("secure_url")
+                or fotos[0].get("url")
+                or ""
+            )
+
+        preco = converter_preco(dados.get("price"))
+
+        print("Preço retornado pela API:", preco)
+
+        return {
+            "titulo": dados.get("title") or "",
+            "imagem": imagem,
+            "preco": preco,
+        }
+
+    except Exception as e:
+        print("Erro ao consultar API:", repr(e))
+        return {}
+
+
+# ---------- BUSCAR PRODUTO ----------
+
+def buscar_produto(url):
+    try:
+        resposta = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Falha ao abrir o link: {e}"
+        )
 
     if resposta.status_code != 200:
         raise RuntimeError(
-            f"O Mercado Livre respondeu HTTP "
-            f"{resposta.status_code}."
+            f"A página retornou HTTP {resposta.status_code}."
         )
 
-    produto = extrair_dados(resposta.text)
+    url_final = resposta.url
 
-    dados_api = consultar_api_ml(resposta.url)
+    print("URL final do produto:", url_final)
+
+    produto = extrair_dados_pagina(resposta.text)
+
+    # A API recebe a URL final, após redirecionamentos.
+    dados_api = consultar_api_ml(url_final)
 
     for campo in ("titulo", "imagem", "preco"):
         if produto.get(campo) in ("", None):
-            if dados_api.get(campo) not in ("", None):
-                produto[campo] = dados_api[campo]
+            valor = dados_api.get(campo)
+
+            if valor not in ("", None):
+                produto[campo] = valor
 
     if not produto["titulo"]:
         raise RuntimeError(
-            "Não consegui encontrar o título do produto."
+            "Não consegui identificar o título. "
+            "A página pode estar bloqueada."
         )
 
-    print(
-        "Produto encontrado:",
-        produto["titulo"],
-        "| Preço:",
-        produto["preco"],
-    )
+    print("Título encontrado:", produto["titulo"])
+    print("Preço final encontrado:", produto["preco"])
 
     return produto
 
+
+# ---------- PUBLICAR NO GRUPO ----------
 
 def montar_legenda(produto):
     titulo = html.escape(
@@ -331,7 +409,8 @@ def montar_legenda(produto):
     else:
         linhas.extend([
             "",
-            "💰 Consulte o preço atual no botão Comprar.",
+            "💰 Não consegui confirmar o preço atual. "
+            "Confira no botão Comprar.",
         ])
 
     return "\n".join(linhas)
@@ -363,7 +442,10 @@ def publicar(produto, link):
         if resultado.get("ok"):
             return True
 
-        print("Erro ao enviar foto; tentando texto.")
+        print(
+            "Erro ao enviar foto:",
+            resultado.get("description"),
+        )
 
     resultado = telegram(
         "sendMessage",
@@ -376,6 +458,8 @@ def publicar(produto, link):
     return resultado.get("ok", False)
 
 
+# ---------- MENSAGENS RECEBIDAS ----------
+
 def processar_mensagem(mensagem):
     chat = mensagem.get("chat", {})
 
@@ -385,15 +469,15 @@ def processar_mensagem(mensagem):
     usuario_id = mensagem.get("from", {}).get("id")
     texto = mensagem.get("text") or ""
 
-    print(f"Mensagem privada recebida do ID {usuario_id}")
+    print("Mensagem recebida do ID:", usuario_id)
 
-    # Se não houver IDs autorizados, informa o ID no privado.
+    # Sem IDs configurados: informa o ID ao usuário.
     if not ALLOWED:
         responder(
             chat["id"],
             f"Seu ID do Telegram é: {usuario_id}\n\n"
             "Adicione esse número ao segredo "
-            "ALLOWED_USER_IDS no GitHub e execute novamente.",
+            "ALLOWED_USER_IDS no GitHub.",
         )
         return
 
@@ -401,11 +485,14 @@ def processar_mensagem(mensagem):
         responder(
             chat["id"],
             f"Seu ID do Telegram é: {usuario_id}\n"
-            "Você ainda não está autorizado a usar este bot.",
+            "Você ainda não está autorizado a usar o bot.",
         )
         return
 
-    links = re.findall(r"https?://[^\s<>\"']+", texto)
+    links = re.findall(
+        r"https?://[^\s<>\"']+",
+        texto,
+    )
 
     if not links:
         responder(
@@ -417,78 +504,83 @@ def processar_mensagem(mensagem):
     for link in links:
         link = link.rstrip(").,;")
 
+        host = (
+            requests.utils.urlparse(link).hostname or ""
+        ).lower()
+
+        if not (
+            "mercadolivre.com" in host
+            or "mercadolibre.com" in host
+            or host.endswith("meli.la")
+        ):
+            responder(
+                chat["id"],
+                "Este bot aceita somente links do Mercado Livre.",
+            )
+            continue
+
         try:
             responder(
                 chat["id"],
-                "🔎 Buscando o produto...",
+                "🔎 Buscando o produto e o preço atual...",
             )
-
-            host = (
-                requests.utils.urlparse(link).hostname or ""
-            ).lower()
-
-            if not (
-                "mercadolivre.com" in host
-                or "mercadolibre.com" in host
-                or host.endswith("meli.la")
-            ):
-                responder(
-                    chat["id"],
-                    "Envie somente links do Mercado Livre.",
-                )
-                continue
 
             produto = buscar_produto(link)
 
             if publicar(produto, link):
                 responder(
                     chat["id"],
-                    "✅ Oferta publicada no grupo!",
+                    "✅ Produto publicado no grupo!",
                 )
             else:
                 responder(
                     chat["id"],
                     "❌ Não consegui publicar no grupo. "
-                    "Confira o ID e as permissões do bot.",
+                    "Confira as permissões do bot.",
                 )
 
-        except Exception as erro:
-            print("Erro ao processar produto:", repr(erro))
+        except Exception as e:
+            print("Erro ao processar produto:", repr(e))
+
             responder(
                 chat["id"],
-                f"❌ Erro ao processar o produto:\n{str(erro)[:300]}",
+                "❌ Erro ao processar o produto:\n"
+                + str(e)[:300],
             )
 
         time.sleep(2)
 
 
+# ---------- EXECUTAR ----------
+
 def main():
     if not TOKEN:
-        print("ERRO: configure o segredo TELEGRAM_TOKEN.")
+        print("ERRO: falta configurar TELEGRAM_TOKEN.")
         sys.exit(1)
 
     resultado = telegram("getMe")
 
     if not resultado.get("ok"):
         print(
-            "ERRO ao conectar ao Telegram:",
+            "Erro ao conectar ao Telegram:",
             resultado.get("description"),
         )
         sys.exit(1)
 
     bot = resultado.get("result", {})
-    print(f"Bot conectado: @{bot.get('username', '')}")
+    print("Bot conectado:", bot.get("username"))
 
     offset = None
 
-    # Uma execução processa as mensagens pendentes e termina.
     while True:
         parametros = {
-            "offset": offset,
             "timeout": 0,
             "limit": 100,
             "allowed_updates": json.dumps(["message"]),
         }
+
+        if offset is not None:
+            parametros["offset"] = offset
 
         resultado = telegram("getUpdates", **parametros)
 
@@ -512,10 +604,10 @@ def main():
             if mensagem:
                 try:
                     processar_mensagem(mensagem)
-                except Exception as erro:
-                    print("Erro na mensagem:", repr(erro))
+                except Exception as e:
+                    print("Erro na mensagem:", repr(e))
 
-    print("Processamento finalizado.")
+    print("Execução concluída.")
 
 
 if __name__ == "__main__":
