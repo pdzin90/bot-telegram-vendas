@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -112,6 +111,8 @@ def extrair_preco_json(conteudo):
     """
 
     padroes = [
+        r'"salePrice"\s*:\s*\{[^{}]*?"amount"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
+        r'"retailPrice"\s*:\s*\{[^{}]*?"amount"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
         r'"price"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
         r'"priceAmount"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
         r'"salePrice"\s*:\s*"?(\d+(?:[.,]\d+)?)"?',
@@ -182,6 +183,7 @@ def extrair_dados_pagina(conteudo):
         "titulo": "",
         "imagem": "",
         "preco": None,
+        "preco_exato": False,
     }
 
     blocos = re.findall(
@@ -229,6 +231,7 @@ def extrair_dados_pagina(conteudo):
 
                 if preco is not None:
                     produto_final["preco"] = preco
+                    produto_final["preco_exato"] = True
                     break
 
         if produto_final["titulo"]:
@@ -257,6 +260,7 @@ def extrair_dados_pagina(conteudo):
 
             if valor is not None:
                 produto_final["preco"] = valor
+                produto_final["preco_exato"] = True
                 break
 
     # Depois tenta dados JSON incorporados na página.
@@ -266,7 +270,7 @@ def extrair_dados_pagina(conteudo):
         )
 
     produto_final["titulo"] = re.sub(
-        r"\s*[|\-–]\s*Mercado Livre.*$",
+        r"\s*[|\-–]\s*(?:Mercado Livre|SHEIN|Shopee).*$",
         "",
         produto_final["titulo"],
         flags=re.I,
@@ -343,9 +347,189 @@ def consultar_api_ml(url):
         return {}
 
 
+# ---------- LOJAS (MERCADO LIVRE, SHOPEE, SHEIN) ----------
+
+def dominio_em(host, dominios):
+    return any(
+        host == d or host.endswith("." + d)
+        for d in dominios
+    )
+
+
+def identificar_loja(link):
+    host = (
+        requests.utils.urlparse(link).hostname or ""
+    ).lower()
+
+    if (
+        "mercadolivre.com" in host
+        or "mercadolibre.com" in host
+        or host.endswith("meli.la")
+    ):
+        return "ml"
+
+    if dominio_em(host, (
+        "shopee.com.br",
+        "shopee.com",
+        "shope.ee",
+        "shp.ee",
+    )):
+        return "shopee"
+
+    if dominio_em(host, (
+        "shein.com",
+        "shein.com.br",
+        "shein.top",
+        "shein.onelink.me",
+    )):
+        return "shein"
+
+    return None
+
+
+NOMES_LOJAS = {
+    "ml": "Mercado Livre",
+    "shopee": "Shopee",
+    "shein": "Shein",
+}
+
+
+# ---------- API DA SHOPEE ----------
+
+def extrair_ids_shopee(*textos):
+    padroes = (
+        r"/product/(\d+)/(\d+)",
+        r"-i\.(\d+)\.(\d+)",
+        r"/opaanlp/(\d+)/(\d+)",
+    )
+
+    for texto in textos:
+        if not texto:
+            continue
+
+        for padrao in padroes:
+            achado = re.search(padrao, texto)
+
+            if achado:
+                return achado.group(1), achado.group(2)
+
+    return None
+
+
+def consultar_api_shopee(url_final, conteudo):
+    ids = extrair_ids_shopee(
+        url_final,
+        obter_meta(conteudo, "og:url") if conteudo else "",
+    )
+
+    if not ids:
+        print("Shopee: não achei shopid/itemid na URL final.")
+        return {}
+
+    shopid, itemid = ids
+
+    try:
+        cabecalhos = dict(HEADERS)
+        cabecalhos.update({
+            "Referer": url_final,
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-API-SOURCE": "pc",
+        })
+
+        resposta = requests.get(
+            "https://shopee.com.br/api/v4/item/get",
+            params={"itemid": itemid, "shopid": shopid},
+            headers=cabecalhos,
+            timeout=20,
+        )
+
+        print("API da Shopee: HTTP", resposta.status_code)
+
+        if resposta.status_code != 200:
+            print("Resposta da API:", resposta.text[:300])
+            return {}
+
+        dados = resposta.json()
+
+        if dados.get("error"):
+            print("API da Shopee devolveu erro:", dados.get("error"))
+            return {}
+
+        item = dados.get("data") or dados.get("item") or {}
+
+        if isinstance(item, dict) and isinstance(
+            item.get("item"), dict
+        ):
+            item = item["item"]
+
+        bruto = item.get("price") or item.get("price_min")
+        preco = None
+
+        if bruto:
+            # a Shopee informa o preço multiplicado por 100000
+            preco = converter_preco(float(bruto) / 100000)
+
+        imagens = item.get("images") or []
+        imagem = ""
+
+        if imagens:
+            imagem = (
+                "https://down-br.img.susercontent.com/file/"
+                f"{imagens[0]}"
+            )
+
+        print("Preço retornado pela Shopee:", preco)
+
+        return {
+            "titulo": item.get("name") or "",
+            "imagem": imagem,
+            "preco": preco,
+        }
+
+    except Exception as e:
+        print("Erro ao consultar API da Shopee:", repr(e))
+        return {}
+
+
 # ---------- BUSCAR PRODUTO ----------
 
+def titulo_generico(titulo, loja):
+    t = (titulo or "").strip().lower()
+
+    if not t:
+        return True
+
+    bloqueio = (
+        "access denied",
+        "captcha",
+        "just a moment",
+        "attention required",
+        "verify you are human",
+        "verificação de segurança",
+    )
+
+    if any(x in t for x in bloqueio):
+        return True
+
+    if loja == "shopee" and (
+        "shopee brasil" in t or "ofertas incr" in t
+    ):
+        return True
+
+    if loja == "shein" and t in (
+        "shein",
+        "shein br",
+        "shein brasil",
+    ):
+        return True
+
+    return False
+
+
 def buscar_produto(url):
+    loja = identificar_loja(url)
+
     try:
         resposta = requests.get(
             url,
@@ -358,33 +542,79 @@ def buscar_produto(url):
             f"Falha ao abrir o link: {e}"
         )
 
-    if resposta.status_code != 200:
-        raise RuntimeError(
-            f"A página retornou HTTP {resposta.status_code}."
-        )
-
     url_final = resposta.url
 
     print("URL final do produto:", url_final)
 
-    produto = extrair_dados_pagina(resposta.text)
+    pagina = resposta.text if resposta.status_code == 200 else ""
 
-    # A API recebe a URL final, após redirecionamentos.
-    dados_api = consultar_api_ml(url_final)
+    # A Shopee pode recusar a página e ainda assim responder à API.
+    if resposta.status_code != 200 and loja != "shopee":
+        aviso = ""
+
+        if loja == "shein":
+            aviso = " A Shein pode estar bloqueando acessos automáticos."
+
+        raise RuntimeError(
+            f"A página retornou HTTP {resposta.status_code}.{aviso}"
+        )
+
+    if pagina:
+        produto = extrair_dados_pagina(pagina)
+    else:
+        produto = {
+            "titulo": "",
+            "imagem": "",
+            "preco": None,
+            "preco_exato": False,
+        }
+
+    # Página de bloqueio ou "casca" sem dados do produto.
+    if loja != "ml" and titulo_generico(produto["titulo"], loja):
+        produto["titulo"] = ""
+        produto["imagem"] = ""
+        produto["preco"] = None
+        produto["preco_exato"] = False
+
+    if loja == "ml":
+        # A API recebe a URL final, após redirecionamentos.
+        dados_api = consultar_api_ml(url_final)
+    elif loja == "shopee":
+        dados_api = consultar_api_shopee(url_final, pagina)
+    else:
+        dados_api = {}
+
+    # Na Shopee a página é montada por JavaScript, então a API manda.
+    api_manda = loja == "shopee"
 
     for campo in ("titulo", "imagem", "preco"):
-        if produto.get(campo) in ("", None):
-            valor = dados_api.get(campo)
+        atual = produto.get(campo)
+        novo = dados_api.get(campo)
 
-            if valor not in ("", None):
-                produto[campo] = valor
+        if novo in ("", None):
+            continue
+
+        if api_manda or atual in ("", None):
+            produto[campo] = novo
+
+            if campo == "preco":
+                produto["preco_exato"] = True
 
     if not produto["titulo"]:
+        if loja in ("shopee", "shein"):
+            raise RuntimeError(
+                f"Não consegui ler o produto. A {NOMES_LOJAS[loja]} "
+                "costuma bloquear a leitura automática."
+            )
+
         raise RuntimeError(
             "Não consegui identificar o título. "
             "A página pode estar bloqueada."
         )
 
+    produto["loja"] = loja
+
+    print("Loja:", loja)
     print("Título encontrado:", produto["titulo"])
     print("Preço final encontrado:", produto["preco"])
 
@@ -394,9 +624,9 @@ def buscar_produto(url):
 # ---------- PUBLICAR NO GRUPO ----------
 
 def montar_legenda(produto):
-    titulo = html.escape(
-        produto.get("titulo") or "Oferta"
-    )
+    # Sem parse_mode no Telegram: não escapar o texto, senão "&"
+    # apareceria como "&amp;".
+    titulo = produto.get("titulo") or "Oferta"
 
     linhas = [f"🔥 {titulo}"]
     preco = produto.get("preco")
@@ -435,7 +665,7 @@ def publicar(produto, link):
             "sendPhoto",
             chat_id=GROUP_ID,
             photo=imagem,
-            caption=legenda,
+            caption=legenda[:1024],
             reply_markup=botoes,
         )
 
@@ -447,18 +677,58 @@ def publicar(produto, link):
             resultado.get("description"),
         )
 
+    texto = legenda
+    previa = "true"
+
+    # Postagem manual (página não lida): deixa o Telegram tentar
+    # montar a prévia com a foto a partir do link.
+    if produto.get("manual"):
+        texto = f"{legenda}\n\n{link}"
+        previa = "false"
+
     resultado = telegram(
         "sendMessage",
         chat_id=GROUP_ID,
-        text=legenda,
+        text=texto[:4096],
         reply_markup=botoes,
-        disable_web_page_preview="true",
+        disable_web_page_preview=previa,
     )
 
     return resultado.get("ok", False)
 
 
 # ---------- MENSAGENS RECEBIDAS ----------
+
+REGEX_LINK = r"https?://[^\s<>\"']+"
+REGEX_PRECO_MANUAL = r"R\$\s*(\d[\d.]*(?:,\d{1,2})?)"
+
+
+def extrair_preco_manual(texto):
+    achado = re.search(REGEX_PRECO_MANUAL, texto or "")
+
+    if not achado:
+        return None
+
+    bruto = achado.group(1)
+
+    # "1.299" sem vírgula são milhares, não decimais.
+    if "," not in bruto and re.fullmatch(r"\d{1,3}(?:\.\d{3})+", bruto):
+        bruto = bruto.replace(".", "")
+
+    return converter_preco(bruto)
+
+
+def extrair_titulo_manual(texto):
+    sem_preco = re.sub(REGEX_PRECO_MANUAL, "", texto or "")
+
+    for linha in sem_preco.splitlines():
+        linha = linha.strip(" -–|:")
+
+        if linha:
+            return linha[:200]
+
+    return ""
+
 
 def processar_mensagem(mensagem):
     chat = mensagem.get("chat", {})
@@ -489,33 +759,34 @@ def processar_mensagem(mensagem):
         )
         return
 
-    links = re.findall(
-        r"https?://[^\s<>\"']+",
-        texto,
-    )
+    links = re.findall(REGEX_LINK, texto)
 
     if not links:
         responder(
             chat["id"],
-            "Envie um link de produto do Mercado Livre.",
+            "Envie um link de produto do Mercado Livre, "
+            "Shopee ou Shein.",
         )
         return
 
+    # Texto extra só vale quando a mensagem tem um único link.
+    extra = ""
+
+    if len(links) == 1:
+        extra = re.sub(REGEX_LINK, "", texto).strip()
+
+    preco_manual = extrair_preco_manual(extra)
+    titulo_manual = extrair_titulo_manual(extra)
+
     for link in links:
         link = link.rstrip(").,;")
+        loja = identificar_loja(link)
 
-        host = (
-            requests.utils.urlparse(link).hostname or ""
-        ).lower()
-
-        if not (
-            "mercadolivre.com" in host
-            or "mercadolibre.com" in host
-            or host.endswith("meli.la")
-        ):
+        if not loja:
             responder(
                 chat["id"],
-                "Este bot aceita somente links do Mercado Livre.",
+                "Este bot aceita links do Mercado Livre, "
+                "Shopee e Shein.",
             )
             continue
 
@@ -525,12 +796,61 @@ def processar_mensagem(mensagem):
                 "🔎 Buscando o produto e o preço atual...",
             )
 
-            produto = buscar_produto(link)
+            try:
+                produto = buscar_produto(link)
+
+            except Exception as erro_leitura:
+                # Plano B: você mandou título e preço junto com o link.
+                if (
+                    loja != "ml"
+                    and titulo_manual
+                    and preco_manual is not None
+                ):
+                    print(
+                        "Leitura falhou, usando dados manuais:",
+                        repr(erro_leitura),
+                    )
+
+                    produto = {
+                        "titulo": titulo_manual,
+                        "imagem": "",
+                        "preco": preco_manual,
+                        "preco_exato": True,
+                        "manual": True,
+                        "loja": loja,
+                    }
+
+                    responder(
+                        chat["id"],
+                        "⚠️ Não consegui ler a página. Vou postar "
+                        "com o título e o preço que você enviou.",
+                    )
+                else:
+                    raise
+
+            else:
+                # "R$ 49,90" escrito por você sempre vence a leitura.
+                if preco_manual is not None:
+                    produto["preco"] = preco_manual
+                    produto["preco_exato"] = True
 
             if publicar(produto, link):
+                aviso = ""
+
+                if loja != "ml" and produto.get("preco") is None:
+                    aviso = (
+                        "\n⚠️ Publicado sem preço. Para incluir, "
+                        "envie o link com 'R$ 49,90' na mesma mensagem."
+                    )
+                elif loja != "ml" and not produto.get("preco_exato"):
+                    aviso = (
+                        "\n⚠️ O preço foi lido de forma aproximada "
+                        "da página. Confira no grupo."
+                    )
+
                 responder(
                     chat["id"],
-                    "✅ Produto publicado no grupo!",
+                    "✅ Produto publicado no grupo!" + aviso,
                 )
             else:
                 responder(
@@ -542,10 +862,21 @@ def processar_mensagem(mensagem):
         except Exception as e:
             print("Erro ao processar produto:", repr(e))
 
+            dica = ""
+
+            if loja != "ml":
+                dica = (
+                    "\n\nDica: envie o título e o preço junto com "
+                    "o link, assim:\n"
+                    "Nome do produto R$ 49,90\n"
+                    "https://link..."
+                )
+
             responder(
                 chat["id"],
                 "❌ Erro ao processar o produto:\n"
-                + str(e)[:300],
+                + str(e)[:300]
+                + dica,
             )
 
         time.sleep(2)
